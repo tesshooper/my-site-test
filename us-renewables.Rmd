@@ -6,13 +6,235 @@ output: html_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
 
+```
+
+## Attach packages
+```{r}
+
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(here)
+library(paletteer) ## Contains a BUNCH of color palettes
+library(tsibble)
+library(fabletools)
+library(fable)
+library(feasts)
+library(forecast)
+library(sf)
+library(tmap)
+library(mapview)
+library(nationalparkcolors)
+
+```
+
+## Monthly US energy consumption (renewables)
+
+```{r read in data}
+
+us_renew <- read_csv(here("data", "renewables_cons_prod.csv")) %>% 
+  clean_names()
+
+# In console, check what values we have in Description column by using: unique(us_renew$description)
 
 
+```
 
+
+- Make description all lowercase
+- Only keep observations where "description" variable contains "consumption"
+- Remove any observations where "description" variable contains "total"
+
+```{r clean data}
+
+# We want to make everything in description column all lowercase and clean dataframe to include all consumption data but leave out total values because we want to look at all the different types of consumption values without totals
+
+renew_clean <- us_renew %>% 
+  mutate(description = str_to_lower(description)) %>% # We want new descriptoin column to contain all lowercase. Overwrites existing description column
+  filter(str_detect(description, pattern = "consumption")) %>% #string detect is a true/false logical function. If true, keep observations. If false, get rid of it. Allows for partial matches
+  filter(!str_detect(description, pattern = "total" )) # ! means to the opposite (does this not contain the word "total" - gets rid of anything in description column that says total)
+  
+
+```
+
+### Convert 'yyyymm' column to a date
+```{r convert date}
+
+## Using lubridate for converting date column
+
+renew_date <- renew_clean %>% 
+  mutate(yr_mo_day = lubridate::parse_date_time(yyyymm, "ym")) %>% # adding a new column called yr_mo_day using lubridate. Sometimes need to explicitly state you're using lubridate within code even though it's loaded
+  mutate(month_sep = yearmonth(yr_mo_day)) %>%  # Just pull year and month separated from the yr_mo_day column--> Want to coerce this to tsibble format as year_month - so that when we use feast to fable later on it's in the correct format (feast to fable needs it to be in tsibble format). Yearmonth is tsibble specific date format
+  mutate(value = as.numeric(value)) %>%  # Converting value column to numeric
+  drop_na(month_sep, value)
+
+
+# Make a version where I have the month & year in separate columns
+
+renew_parsed <- renew_date %>% 
+  mutate(month = month(yr_mo_day, label = TRUE)) %>%  # Label = TRUE gives it the actual name of month. If you don't include that it will just provide a number for each month
+  mutate(year = year(yr_mo_day))
+
+```
+
+### Look at it:
+
+```{r}
+
+renew_gg <- ggplot(data = renew_date, aes(x = month_sep, 
+                                          y = value,
+                                          group = description)) +
+  geom_line(aes(color = description))
+
+
+renew_gg
+
+# Because this is discrete data, we want discrete color palette, not continuous
+# In console you can view palettes in paletteer using View(palettes_d_names)
+
+```
+
+Updating colors with Paletteer palettes:
+```{r}
+
+# Start with base graph renew_gg
+
+renew_gg +
+  scale_color_paletteer_d("nationalparkcolors::CraterLake") # Updating the color aesthetic. Using paletteer d since we're using discrete. Look in package::name of palette
+
+
+```
+
+
+### Coerce renew_parsed into a tsibble
+```{r}
+
+renew_ts <- as_tsibble(renew_parsed, key = description, index = month_sep) # Index is tsibble compatable time variable we've created. So far we've created one variable that's using tsibble funciton which is month_sep
+
+
+```
+
+
+Let's look at our ts data in a couple different ways:
+```{r}
+
+renew_ts %>% autoplot(value) # Tell it what varaible you want to autoplot over time, which is value. We've told it already that the key grouping is description
+
+renew_ts %>%  gg_subseries(value) # We have differnt energy sources on right side, which are broken up by month for each of the different types across the different years. 
+
+
+# Season plot -- within each season, if I plot each of the years separately, how is that changing?
+#renew_ts %>%  gg_season(value) 
+## error message : Error in ggplot2::scale_x_date()$trans$breaks(limit, n = len) : unused argument (n = len)
+
+
+## Let's make this gg_season plot in ggplot since it didn't work 
+
+ggplot(data = renew_parsed, aes(x = month, y = value, group = year)) + # using parsed version so we can facet wrap by year
+  geom_line(aes(color = year)) + # Want each year to have a different color
+  facet_wrap(~ description, 
+             ncol = 1, 
+             scales = "free",
+             strip.position = "right") # When I facet wrap this I want only one column and I want the scales to change and I want the description names on the right
+```
+
+
+### Just look at they hydroelectric energy consumption
+
+```{r}
+
+hydro_ts <- renew_ts %>% 
+  filter(description == "hydroelectric power consumption")
+
+hydro_ts %>% autoplot(value)
+
+hydro_ts %>% gg_subseries(value)
+
+#hydro_ts %>% gg_season(value)
+
+
+ggplot(hydro_ts, aes(x = month, y = value, group = year)) +
+  geom_line(aes(color = year))
+
+```
+
+
+### What if I want quarterly average consumptoin for hydro
+
+```{r}
+
+hydro_quarterly <- hydro_ts %>% 
+  index_by(year_qu = ~(yearquarter(.))) %>% # Based on the different groups that exist (.)
+  summarize(avg_consumption = mean(value)) # Want the average by quarter. Can index different increments of time (e.g month, day, quarter, etc.)
+
+head(hydro_quarterly)
+
+```
+
+
+### Decompose that hydro_ts
+```{r}
+
+dcmp <- hydro_ts %>% 
+  model(STL(value ~ season (window = 5))) # Seasonal and trend calculations - model our values as a function of different season. Using window of 5 for moving average
+
+components(dcmp) %>% 
+  autoplot()
+```
+
+
+```{r}
+
+# Apply a histogram to the components of my dcmp just for the remainder values
+
+hist(components(dcmp)$remainder)
 
 
 
 ```
+
+Now look at the ACF:
+
+```{r}
+
+# Autocorellation Function in feast package
+
+hydro_ts %>% 
+  ACF(value) %>% 
+  autoplot()
+
+# Shows seasonality. Each lag is by month (6, 12 months). Observations that are 12 months apart are more corellated versus any other time
+```
+
+# DANGER DANGER
+
+```{r}
+
+### NEED TO DO MORE RESEARCH ON THIS
+
+hydro_model <- hydro_ts %>% 
+  model(
+    ARIMA(value),
+      ETS(value)
+  ) %>% 
+  fabletools::forecast(h = "4 years" ) # Using forecast, tell how long into the future you want to forecast
+
+hydro_model %>% autoplot(filter(hydro_ts, year(month_sep) > 2010)) # Only shows the forecasted values with 80 and 95 % confidence bands. We filtered for years after 2010
+
+```
+
+### Make a world map!
+
+```{r}
+
+world <- read_sf(dsn= here("data", "TM_WORLD_BORDERS_SIMPL-0.3-1"),
+                 layer = "TM_WORLD_BORDERS_SIMPL-0.3")
+
+mapview(world)
+
+
+```
+
